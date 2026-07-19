@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import baostock as bs
+import numpy as np
 import pandas as pd
 
 try:
@@ -35,7 +36,9 @@ OUTPUT_COLUMNS = [
 ]
 PRICE_COLUMNS = ["开盘", "收盘", "最高", "最低"]
 ZERO_FILL_COLUMNS = ["成交量", "成交额", "振幅", "涨跌额", "换手率", "涨跌幅"]
+NONNEGATIVE_COLUMNS = ["成交量", "成交额", "振幅", "换手率"]
 QUOTE_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
+NO_ADJUSTMENT = "3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -252,7 +255,7 @@ def _normalise_baostock(frame: pd.DataFrame) -> pd.DataFrame:
 def fetch_baostock_history(code: str, start_date: str, end_date: str) -> pd.DataFrame:
     response = bs.query_history_k_data_plus(
         _bs_code(code), QUOTE_FIELDS, start_date=start_date, end_date=end_date,
-        frequency="d", adjustflag="1",
+        frequency="d", adjustflag=NO_ADJUSTMENT,
     )
     frame = _response_rows(response, f"BaoStock quote {_pure_code(code)}")
     return _normalise_baostock(frame) if not frame.empty else pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -263,7 +266,7 @@ def fetch_akshare_history(code: str, start_date: str, end_date: str) -> pd.DataF
         raise RuntimeError("AkShare is not installed")
     frame = ak.stock_zh_a_hist(
         symbol=_pure_code(code), period="daily", start_date=start_date.replace("-", ""),
-        end_date=end_date.replace("-", ""), adjust="hfq",
+        end_date=end_date.replace("-", ""), adjust="",
     )
     if frame.empty:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -277,14 +280,40 @@ def fetch_akshare_history(code: str, start_date: str, end_date: str) -> pd.DataF
     return frame[OUTPUT_COLUMNS]
 
 
-def clean_quote(frame: pd.DataFrame) -> pd.DataFrame:
+def clean_quote(
+    frame: pd.DataFrame,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
     """Apply the stable output contract to fresh and cached quote frames."""
     cleaned = frame.copy()
+    required = set(OUTPUT_COLUMNS)
+    if not required.issubset(cleaned.columns):
+        missing = sorted(required - set(cleaned.columns))
+        raise ValueError(f"Quote is missing columns: {missing}")
+    cleaned["股票代码"] = cleaned["股票代码"].astype(str).str.zfill(6)
+    if (~cleaned["股票代码"].str.fullmatch(r"\d{6}")).any():
+        raise ValueError("Quote contains invalid stock codes")
+    cleaned["日期"] = pd.to_datetime(cleaned["日期"], errors="coerce")
+    if cleaned["日期"].isna().any():
+        raise ValueError("Quote contains invalid dates")
+    if start_date is not None and (cleaned["日期"] < pd.Timestamp(start_date)).any():
+        raise ValueError("Quote contains dates before requested start date")
+    if end_date is not None and (cleaned["日期"] > pd.Timestamp(end_date)).any():
+        raise ValueError("Quote contains dates after requested end date")
+    cleaned["日期"] = cleaned["日期"].dt.strftime("%Y-%m-%d")
+    if cleaned.duplicated(["股票代码", "日期"]).any():
+        raise ValueError("Quote contains duplicate stock/date rows")
+    for column in PRICE_COLUMNS + ZERO_FILL_COLUMNS:
+        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
     missing_prices = cleaned[PRICE_COLUMNS].isna().any(axis=1)
     if missing_prices.any():
         raise ValueError(f"Quote contains {int(missing_prices.sum())} rows with missing prices")
-    for column in ZERO_FILL_COLUMNS:
-        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce").fillna(0.0)
+    if (~np.isfinite(cleaned[PRICE_COLUMNS].to_numpy())).any() or (cleaned[PRICE_COLUMNS] <= 0).any().any():
+        raise ValueError("Quote contains non-positive or non-finite prices")
+    cleaned[ZERO_FILL_COLUMNS] = cleaned[ZERO_FILL_COLUMNS].fillna(0.0)
+    if (~np.isfinite(cleaned[ZERO_FILL_COLUMNS].to_numpy())).any() or (cleaned[NONNEGATIVE_COLUMNS] < 0).any().any():
+        raise ValueError("Quote contains negative or non-finite quantities")
     return cleaned[OUTPUT_COLUMNS]
 
 
@@ -372,13 +401,17 @@ def main() -> None:
                         )
                         fallback_count += 1
                     _atomic_csv(quote, cache_path)
-                quote = clean_quote(quote)
+                quote = clean_quote(quote, start_date, end_date)
                 all_data.append(quote)
                 LOG.info("[%d] %s complete (%d rows)", index, code, len(quote))
             except Exception as exc:
                 failures.append({"股票代码": code, "错误": str(exc)})
                 LOG.error("%s failed: %s", code, exc)
 
+        failed_path = output_path.parent / "failed_stocks.csv"
+        _atomic_csv(pd.DataFrame(failures, columns=["股票代码", "错误"]), failed_path)
+        if failures:
+            raise RuntimeError(f"Failed to collect {len(failures)} stocks; see {failed_path}")
         combined = filter_by_membership(pd.concat(all_data, ignore_index=True), membership) if all_data else pd.DataFrame(columns=OUTPUT_COLUMNS)
         if combined.empty:
             raise RuntimeError("No quote data was collected")
@@ -392,8 +425,6 @@ def main() -> None:
             shutil.copy2(output_path, backup)
             LOG.info("Backed up existing output to %s", backup)
         _atomic_csv(combined, output_path)
-        failed_path = output_path.parent / "failed_stocks.csv"
-        _atomic_csv(pd.DataFrame(failures, columns=["股票代码", "错误"]), failed_path)
         LOG.info("Collected %d rows for %d stocks; AkShare fallback=%d; failures=%d", len(combined), combined["股票代码"].nunique(), fallback_count, len(failures))
     finally:
         bs.logout()
