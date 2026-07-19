@@ -20,3 +20,9 @@ wheels/
 *.tar
 
 temp
+
+# Downloaded/generated market data and local crawler state
+data/stock_data.csv
+data/stock_data.before_*.csv
+data/raw_cache/
+data/failed_stocks.csv
