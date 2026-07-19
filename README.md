@@ -113,7 +113,7 @@
 抓取 2018—2024 年数据：
 
 ```powershell
-uv run python get_stock_data.py --start-date 2018-01-01 --end-date 2024-12-31
+uv run python get_stock_data.py --start-date 2018-01-01 --end-date 2026-12-31
 ```
 
 2) 激活虚拟环境

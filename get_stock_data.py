@@ -44,7 +44,7 @@ NO_ADJUSTMENT = "3"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-date", default="2018-01-01")
-    parser.add_argument("--end-date", default="2024-12-31")
+    parser.add_argument("--end-date", default="2026-12-31")
     parser.add_argument("--output", default="data/stock_data.csv")
     parser.add_argument("--cache-dir", default="data/raw_cache")
     parser.add_argument("--max-retries", type=int, default=3)
@@ -366,7 +366,8 @@ def main() -> None:
         membership = build_membership(
             trading_days, cache_dir, args.max_retries, args.sleep_seconds, args.force_refresh
         )
-        membership_path = output_path.parent / "hs300_membership_2018_2024.csv"
+        range_label = f"{start_date[:4]}_{end_date[:4]}"
+        membership_path = output_path.parent / f"hs300_membership_{range_label}.csv"
         _atomic_csv(membership, membership_path)
 
         latest = membership[membership["失效日期"] == trading_days[-1]][["股票代码", "股票名称"]]
@@ -420,7 +421,7 @@ def main() -> None:
             raise ValueError(f"Output contains {duplicates} duplicate stock/date rows")
         if output_path.exists():
             backup = output_path.with_name(
-                f"{output_path.stem}.before_2018_2024_{datetime.now():%Y%m%d_%H%M%S}{output_path.suffix}"
+                f"{output_path.stem}.before_{range_label}_{datetime.now():%Y%m%d_%H%M%S}{output_path.suffix}"
             )
             shutil.copy2(output_path, backup)
             LOG.info("Backed up existing output to %s", backup)
