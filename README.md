@@ -87,7 +87,7 @@
 - 按交易日查询历史沪深300成分股，避免用当前成分股回填历史；
 - 使用 BaoStock 后复权日线，单只股票请求失败时切换 AkShare；
 - 每只股票独立缓存，支持重试、断点续抓和失败清单；
-- 输出 `data/hs300_membership_2018_2024.csv`、`data/stock_data.csv` 和 `data/failed_stocks.csv`。
+- 输出 `data/hs300_membership_2018_2026.csv`、`data/stock_data.csv` 和 `data/failed_stocks.csv`。
 
 ---
 
@@ -110,7 +110,7 @@
 
 `uv sync`
 
-抓取 2018—2024 年数据：
+抓取 2018—2026 年数据：
 
 ```powershell
 uv run python get_stock_data.py --start-date 2018-01-01 --end-date 2026-12-31
