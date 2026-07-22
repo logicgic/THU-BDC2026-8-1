@@ -1,8 +1,8 @@
 # THU-BigDataCompetition-2026-baseline
 
 本项目是一个面向沪深300成分股的**排序学习选股**方案：
-- 输入：每只股票过去一段时间（默认60个交易日）的量价与技术特征序列；
-- 模型：`StockTransformer`，同时建模单股票时序模式与股票间交互；
+- 输入：完整历史行情生成的横截面技术特征；
+- 模型：`XGBRanker`，按交易日学习股票横截面排序；
 - 输出：对同一天全部候选股票打分并排序，最终输出前5只股票（等权重0.2）。
 
 ---
@@ -12,12 +12,12 @@
 核心目标是学习“当天应优先持有哪些股票”的排序函数，而不是单只股票二分类。
 
 训练与推理主流程如下：
-1. 读取历史行情数据（`data/stock_data.csv`）；
-2. 做特征工程（39特征或`158+39`特征）；
-3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
-4. 按“日期”组织排序样本：每个样本是一日内多只股票的序列与目标；
-5. 训练排序模型，监控 `final_score` 并保存最优权重；
-6. 使用训练好的 `best_model.pth` + `scaler.pkl` 在最新日期上生成Top5选股结果。
+1. 读取完整历史行情数据（`data/stock_data.csv`）；
+2. 生成官方技术因子及同日 rank/zscore 特征；
+3. 构建未来开盘收益和按日分桶的 `label_rank`；
+4. 按交易日切分训练集、5日隔离带、验证集和预测日；
+5. 使用 `XGBRanker` 训练并计算 `ndcg@5` 与 Top5 收益指标；
+6. 对最新交易日预测并生成 `output/result.csv`。
 
 ---
 
@@ -25,22 +25,12 @@
 
 ### [config.py](config.py)
 统一管理训练与推理参数，包括：
-- 序列长度 `sequence_length`（默认60）；
-- 模型超参数（`d_model`、`nhead`、`num_layers` 等）；
-- 训练超参数（`batch_size`、`num_epochs`、`learning_rate`）；
-- 排序损失权重参数（`pairwise_weight`、`top5_weight`、`base_weight`）；
-- 数据路径和输出路径（默认输出到 `output/`）。
+- XGBoost Rank 树模型参数；
+- 验证集 20 个交易日及 5 个交易日隔离带；
+- 最小 query 股票数、模型目录和提交路径。
 
-### [model.py](model.py)
-定义核心模型 `StockTransformer`，主要由以下模块组成：
-- `PositionalEncoding`：时序位置编码；
-- 时序编码器 `TransformerEncoder`：提取单股票历史序列表示；
-- `FeatureAttention`：对时间维特征做注意力聚合；
-- `CrossStockAttention`：在同一交易日内建模股票间关系；
-- `ranking_layers` + `score_head`：输出每只股票的排序分数。
-
-输入形状：`[batch, num_stocks, seq_len, feature_dim]`  
-输出形状：`[batch, num_stocks]`。
+### [feature_engineering.py](code/src/feature_engineering.py)
+生成 28 个官方技术因子，以及同日横截面 rank/zscore 转换，构造 `label_rank` 并冻结模型特征列。
 
 ### [utils.py](utils.py)
 包含特征工程与数据集构建逻辑：
@@ -51,36 +41,11 @@
 
 说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
 
-### [train.py](train.py)
-训练主脚本，关键内容：
-- 数据预处理：
-	- `_preprocess_common()`：按股票分组并行特征工程、股票ID映射、标签构建；
-	- `split_train_val_by_last_month()`：按最后阶段数据切分训练/验证集，并保留序列上下文。
-- 数据集组织：
-	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
-- 损失函数：`WeightedRankingLoss`
-	- 组合了 `listwise_loss` 与 `pairwise_loss`；
-	- 对真实Top-k样本施加更高权重。
-- 评估指标：`calculate_ranking_metrics()`
-	- 计算 `pred_return_sum`、`max_return_sum`、`ratio_pred`、`final_score` 等；
-	- 训练过程中以验证集 `final_score` 选择最优模型。
+### [train.py](code/src/train.py)
+使用交易日作为 `qid` 训练 `XGBRanker`，保存模型、切分数据、训练配置和验证指标。
 
-训练产物：
-- `best_model.pth`：最佳模型参数；
-- `scaler.pkl`：标准化器；
-- `config.json`：训练时配置快照；
-- `final_score.txt`：最佳分数记录；
-- `log/`：TensorBoard日志。
-
-### [predict.py](predict.py)
-推理主脚本，流程：
-1. 加载历史数据，取最新交易日；
-2. 执行与训练一致的特征工程；
-3. 加载 `scaler.pkl` 进行特征标准化；
-4. 用 `best_model.pth` 对全部可预测股票打分；
-5. 按分数降序取前5只，输出到 `output.csv`：
-	 - `stock_id`
-	 - `weight`（固定 `0.2`）
+### [predict.py](code/src/predict.py)
+读取冻结特征列和 XGBoost 模型，对最新交易日排序，输出 `stock_id,weight` 到 `output/result.csv`。
 
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（BaoStock 主源，AkShare 单股备用）：

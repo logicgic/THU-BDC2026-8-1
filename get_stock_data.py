@@ -317,6 +317,26 @@ def clean_quote(
     return cleaned[OUTPUT_COLUMNS]
 
 
+def required_quote_end(
+    requested_end: str,
+    membership_end: str,
+    as_of: date | pd.Timestamp | None = None,
+) -> str:
+    """Return the last date a stock cache is expected to cover."""
+    today = pd.Timestamp(as_of if as_of is not None else date.today()).normalize()
+    return min(
+        pd.Timestamp(requested_end), pd.Timestamp(membership_end), today
+    ).strftime("%Y-%m-%d")
+
+
+def quote_cache_needs_update(frame: pd.DataFrame, required_end: str) -> bool:
+    """Treat empty, malformed, or date-stale quote caches as incomplete."""
+    if frame.empty or "日期" not in frame.columns:
+        return True
+    dates = pd.to_datetime(frame["日期"], errors="coerce")
+    return dates.isna().any() or dates.max() < pd.Timestamp(required_end)
+
+
 def filter_by_membership(data: pd.DataFrame, membership: pd.DataFrame) -> pd.DataFrame:
     if data.empty:
         return data
@@ -382,25 +402,61 @@ def main() -> None:
         for index, code in enumerate(sorted(membership["股票代码"].unique()), start=1):
             cache_path = quote_dir / f"{code}.csv"
             try:
+                membership_end = membership.loc[
+                    membership["股票代码"] == code, "失效日期"
+                ].max()
+                required_end = required_quote_end(end_date, membership_end)
+                cached_quote: pd.DataFrame | None = None
+                fetch_start = start_date
+
                 if cache_path.exists() and not args.force_refresh:
-                    quote = pd.read_csv(cache_path, dtype={"股票代码": str})
-                else:
+                    cached_quote = clean_quote(
+                        pd.read_csv(cache_path, dtype={"股票代码": str}),
+                        start_date,
+                        end_date,
+                    )
+                    if cached_quote.empty:
+                        cached_quote = None
+                    elif not quote_cache_needs_update(cached_quote, required_end):
+                        quote = cached_quote
+                    else:
+                        cache_max = pd.to_datetime(cached_quote["日期"]).max()
+                        fetch_start = (cache_max + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                        LOG.info(
+                            "%s cache ends at %s; updating through %s",
+                            code,
+                            cache_max.strftime("%Y-%m-%d"),
+                            required_end,
+                        )
+
+                if (
+                    args.force_refresh
+                    or cached_quote is None
+                    or quote_cache_needs_update(cached_quote, required_end)
+                ):
                     try:
-                        quote = _retry(
-                            lambda: fetch_baostock_history(code, start_date, end_date),
+                        fresh_quote = _retry(
+                            lambda: fetch_baostock_history(code, fetch_start, end_date),
                             f"BaoStock quote {code}", args.max_retries, args.sleep_seconds,
                         )
-                        if quote.empty:
+                        if fresh_quote.empty and cached_quote is None:
                             raise RuntimeError("BaoStock returned no quote rows")
                     except Exception as primary_error:
                         if args.no_akshare_fallback:
                             raise
                         LOG.warning("Using AkShare fallback for %s: %s", code, primary_error)
-                        quote = _retry(
-                            lambda: fetch_akshare_history(code, start_date, end_date),
+                        fresh_quote = _retry(
+                            lambda: fetch_akshare_history(code, fetch_start, end_date),
                             f"AkShare quote {code}", args.max_retries, args.sleep_seconds,
                         )
                         fallback_count += 1
+                    if cached_quote is not None:
+                        quote = pd.concat([cached_quote, fresh_quote], ignore_index=True)
+                        quote = quote.drop_duplicates(["股票代码", "日期"], keep="last")
+                        quote = quote.sort_values(["股票代码", "日期"]).reset_index(drop=True)
+                    else:
+                        quote = fresh_quote
+                    quote = clean_quote(quote, start_date, end_date)
                     _atomic_csv(quote, cache_path)
                 quote = clean_quote(quote, start_date, end_date)
                 all_data.append(quote)

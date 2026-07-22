@@ -127,9 +127,6 @@ def engineer_features_39(df):
     # 处理 inf 和 -inf
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # 填充 NaN 值（注意：这可能引入偏差，根据下游任务决定是否保留）
-    df.fillna(0, inplace=True)
-
     return df
 
 def engineer_features(df):

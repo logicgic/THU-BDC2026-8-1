@@ -1,23 +1,25 @@
-# 配置参数
-sequence_length = 60
-feature_num = '158+39'
-config = {
-    'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
-    'd_model': 256,          # Transformer输入维度
-    'nhead': 4,             # 注意力头数量
-    'num_layers': 3,        # Transformer层数
-    'dim_feedforward': 512, # 前馈网络维度
-    'batch_size': 4,        # 排序任务batch_size可以小一些，因为每个batch包含更多股票
-    'num_epochs': 50,       # 排序任务可能需要更多epochs
-    'learning_rate': 1e-5,  # 稍微降低学习率
-    'dropout': 0.1,
-    'feature_num': feature_num,
-    'max_grad_norm': 5.0,
+"""XGBoost Rank training configuration."""
 
-    'pairwise_weight': 1, # 配对损失权重
-    'base_weight': 1.0, # 非top-k样本权重
-    'top5_weight': 2.0, # top-5样本权重（应大于base_weight）
-
-    'output_dir': f'./model/{sequence_length}_{feature_num}',
-    'data_path': './data',
+RANK_CONFIG = {
+    "objective": "rank:ndcg",
+    "eval_metric": "ndcg@5",
+    "tree_method": "hist",
+    "learning_rate": 0.05,
+    "max_depth": 5,
+    "min_child_weight": 30,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 1.0,
+    "n_estimators": 600,
+    "early_stopping_rounds": 50,
+    "random_state": 2026,
 }
+
+VALID_DAYS = 20
+GAP_DAYS = 5
+MIN_GROUP_SIZE = 10
+TOP_K = 5
+DEFAULT_FEATURE_TABLE = "data/features_xgb_rank/feature_table.csv"
+DEFAULT_FEATURE_CONFIG = "data/features_xgb_rank/feature_config.json"
+DEFAULT_MODEL_DIR = "model/xgb_rank"
+DEFAULT_OUTPUT = "output/result.csv"
