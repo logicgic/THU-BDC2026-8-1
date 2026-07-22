@@ -1,388 +1,434 @@
 #!/usr/bin/env python3
+"""Download point-in-time HS300 constituents and daily stock data.
+
+BaoStock is the primary source.  AkShare is used only for individual quote
+requests that still fail after BaoStock retries; it is never used to build a
+historical constituent list.
 """
-获取沪深300指数成分股历史数据
-- 获取2026年2月20日沪深300的300个成分股
-- 抓取每只股票从2015年至今的历史量价数据
-- 使用baostock平台
-- 保存格式: 股票代码,日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌额,换手率,涨跌幅
-"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import shutil
+import time
+from collections.abc import Callable
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
 
 import baostock as bs
+import numpy as np
 import pandas as pd
-from datetime import datetime
-import os
-import time
+
+try:
+    import akshare as ak
+except ImportError:  # pragma: no cover - only reached with a broken environment
+    ak = None
 
 
-def login():
-    """登录baostock"""
-    lg = bs.login()
-    if lg.error_code != '0':
-        raise Exception(f"登录失败: {lg.error_msg}")
-    print("baostock登录成功")
-    return lg
+LOG = logging.getLogger("hs300-data")
+OUTPUT_COLUMNS = [
+    "股票代码", "日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
+    "振幅", "涨跌额", "换手率", "涨跌幅",
+]
+PRICE_COLUMNS = ["开盘", "收盘", "最高", "最低"]
+ZERO_FILL_COLUMNS = ["成交量", "成交额", "振幅", "涨跌额", "换手率", "涨跌幅"]
+NONNEGATIVE_COLUMNS = ["成交量", "成交额", "振幅", "换手率"]
+QUOTE_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
+NO_ADJUSTMENT = "3"
 
 
-def logout():
-    """登出baostock"""
-    bs.logout()
-    print("baostock已登出")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start-date", default="2018-01-01")
+    parser.add_argument("--end-date", default="2026-12-31")
+    parser.add_argument("--output", default="data/stock_data.csv")
+    parser.add_argument("--cache-dir", default="data/raw_cache")
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--sleep-seconds", type=float, default=1.0)
+    parser.add_argument("--no-akshare-fallback", action="store_true")
+    parser.add_argument("--force-refresh", action="store_true")
+    return parser.parse_args()
 
 
-def get_hs300_stocks():
-    """获取沪深300成分股列表"""
-    print("正在获取沪深300成分股列表...")
-    
-    rs = bs.query_hs300_stocks()
-    
-    if rs.error_code != '0':
-        raise Exception(f"获取成分股失败: {rs.error_msg}")
-    
-    stocks = []
-    while (rs.error_code == '0') & rs.next():
-        stocks.append(rs.get_row_data())
-    
-    df = pd.DataFrame(stocks, columns=rs.fields)
-    print(f"获取到 {len(df)} 只沪深300成分股")
-    return df
+def _normalise_date(value: str | date | pd.Timestamp) -> str:
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
 
 
-def get_stock_history(bs_code, start_date, end_date):
-    """获取单只股票历史数据"""
-    rs = bs.query_history_k_data_plus(bs_code,
-        "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg",
-        start_date=start_date, end_date=end_date,
-        frequency="d", adjustflag="1")  # adjustflag="1"表示后复权
-    
-    if rs.error_code != '0':
-        raise Exception(f"查询失败: {rs.error_msg}")
-    
-    data_list = []
-    while (rs.error_code == '0') & rs.next():
-        data_list.append(rs.get_row_data())
-    
-    if not data_list:
-        return None
-    
-    df = pd.DataFrame(data_list, columns=rs.fields)
-    
-    # 转换数据类型
-    numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # 计算振幅和涨跌额
-    df['振幅'] = ((df['high'] - df['low']) / df['preclose'] * 100).round(2)
-    df['涨跌额'] = (df['close'] - df['preclose']).round(2)
-    
-    # 转换日期格式 YYYY/M/D
-    df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y/%-m/%-d')
-    
-    # 提取纯数字股票代码（统一为6位格式，不足前面补0）
-    df['code'] = df['code'].str.replace('sh.', '').str.replace('sz.', '')
-    df['code'] = df['code'].str.zfill(6)
-    
-    # 重命名列
-    df = df.rename(columns={
-        'code': '股票代码',
-        'date': '日期',
-        'open': '开盘',
-        'close': '收盘',
-        'high': '最高',
-        'low': '最低',
-        'volume': '成交量',
-        'amount': '成交额',
-        'turn': '换手率',
-        'pctChg': '涨跌幅'
-    })
-    
-    columns = ['股票代码', '日期', '开盘', '收盘', '最高', '最低', 
-               '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅']
-    df = df[columns]
-    
-    return df
+def _pure_code(code: str) -> str:
+    return str(code).lower().replace("sh.", "").replace("sz.", "").zfill(6)
 
 
-def get_existing_stocks(output_path):
-    """获取已经保存的股票代码列表"""
-    if not os.path.exists(output_path):
-        return set()
+def _bs_code(code: str) -> str:
+    pure = _pure_code(code)
+    return f"sh.{pure}" if pure.startswith(("5", "6", "9")) else f"sz.{pure}"
+
+
+def _retry(
+    operation: Callable[[], Any],
+    name: str,
+    retries: int,
+    sleep_seconds: float,
+) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return operation()
+        except Exception as exc:  # APIs expose failures as both errors and exceptions.
+            last_error = exc
+            if attempt < retries:
+                delay = sleep_seconds * attempt
+                LOG.warning("%s failed (%s); retrying in %.1fs", name, exc, delay)
+                time.sleep(delay)
+    raise RuntimeError(f"{name} failed after {retries} attempts") from last_error
+
+
+def _response_rows(response: Any, name: str) -> pd.DataFrame:
+    if getattr(response, "error_code", "0") != "0":
+        raise RuntimeError(f"{name} failed: {getattr(response, 'error_msg', '')}")
+    rows: list[list[str]] = []
+    while response.next():
+        rows.append(response.get_row_data())
+    return pd.DataFrame(rows, columns=response.fields)
+
+
+def query_trade_dates(
+    start_date: str,
+    end_date: str,
+    retries: int,
+    sleep_seconds: float,
+) -> list[str]:
+    response = _retry(
+        lambda: bs.query_trade_dates(start_date=start_date, end_date=end_date),
+        "BaoStock trade calendar",
+        retries,
+        sleep_seconds,
+    )
+    frame = _response_rows(response, "BaoStock trade calendar")
+    if frame.empty:
+        raise RuntimeError("BaoStock returned an empty trade calendar")
+    frame["is_trading_day"] = pd.to_numeric(frame["is_trading_day"], errors="coerce")
+    return frame.loc[frame["is_trading_day"] == 1, "calendar_date"].map(_normalise_date).tolist()
+
+
+def _snapshot_path(cache_dir: Path, snapshot_date: str) -> Path:
+    return cache_dir / "membership" / f"{snapshot_date}.json"
+
+
+def query_constituents(
+    snapshot_date: str,
+    cache_dir: Path,
+    retries: int,
+    sleep_seconds: float,
+    force_refresh: bool = False,
+) -> dict[str, str]:
+    path = _snapshot_path(cache_dir, snapshot_date)
+    if path.exists() and not force_refresh:
+        return {str(k): str(v) for k, v in json.loads(path.read_text(encoding="utf-8")).items()}
+
+    response = _retry(
+        lambda: bs.query_hs300_stocks(date=snapshot_date),
+        f"BaoStock HS300 constituents {snapshot_date}",
+        retries,
+        sleep_seconds,
+    )
+    frame = _response_rows(response, f"BaoStock HS300 constituents {snapshot_date}")
+    if frame.empty or not {"code", "code_name"}.issubset(frame.columns):
+        raise RuntimeError(f"No valid HS300 constituents returned for {snapshot_date}")
+    constituents = {_pure_code(row.code): str(row.code_name) for row in frame.itertuples()}
+    if len(constituents) != 300:
+        raise RuntimeError(f"Expected 300 constituents on {snapshot_date}, got {len(constituents)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(constituents, ensure_ascii=False, indent=2), encoding="utf-8")
+    return constituents
+
+
+def _first_trading_days(trading_days: list[str]) -> list[str]:
+    return list(pd.Series(trading_days).groupby(pd.to_datetime(trading_days).to_period("M")).first())
+
+
+def _find_transition(
+    trading_days: list[str],
+    left: int,
+    right: int,
+    left_set: set[str],
+    right_set: set[str],
+    query: Callable[[str], dict[str, str]],
+) -> tuple[int, dict[str, str]]:
+    """Find the first trading day carrying right_set between two probes."""
+    while left + 1 < right:
+        middle = (left + right) // 2
+        middle_values = query(trading_days[middle])
+        if set(middle_values) == left_set:
+            left = middle
+        else:
+            right = middle
+            right_set = set(middle_values)
+    return right, query(trading_days[right])
+
+
+def build_membership(
+    trading_days: list[str],
+    cache_dir: Path,
+    retries: int,
+    sleep_seconds: float,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    probes = _first_trading_days(trading_days)
+    snapshots: dict[str, dict[str, str]] = {}
+    query = lambda day: query_constituents(day, cache_dir, retries, sleep_seconds, force_refresh)
+    for day in probes:
+        snapshots[day] = query(day)
+
+    probe_indices = [trading_days.index(day) for day in probes]
+    for index in range(1, len(probes)):
+        before = snapshots[probes[index - 1]]
+        after = snapshots[probes[index]]
+        if set(before) == set(after):
+            continue
+        transition_index, transition_values = _find_transition(
+            trading_days,
+            probe_indices[index - 1],
+            probe_indices[index],
+            set(before),
+            set(after),
+            query,
+        )
+        snapshots[trading_days[transition_index]] = transition_values
+
+    ordered = sorted(snapshots.items(), key=lambda item: item[0])
+    rows: list[dict[str, str]] = []
+    for index, (effective, values) in enumerate(ordered):
+        end = ordered[index + 1][0] if index + 1 < len(ordered) else None
+        end_date = (
+            trading_days[trading_days.index(end) - 1]
+            if end is not None
+            else trading_days[-1]
+        )
+        for code, name in values.items():
+            rows.append({
+                "股票代码": code,
+                "股票名称": name,
+                "生效日期": effective,
+                "失效日期": end_date,
+            })
+    membership = pd.DataFrame(rows).drop_duplicates()
+    membership = membership.sort_values(["生效日期", "股票代码"]).reset_index(drop=True)
+    _validate_membership(membership, trading_days)
+    return membership
+
+
+def _validate_membership(membership: pd.DataFrame, trading_days: list[str]) -> None:
+    required = {"股票代码", "股票名称", "生效日期", "失效日期"}
+    if membership.empty or not required.issubset(membership.columns):
+        raise ValueError("Historical membership is empty or missing required columns")
+    for code, group in membership.groupby("股票代码"):
+        intervals = group.sort_values("生效日期")
+        if intervals["生效日期"].duplicated().any():
+            raise ValueError(f"Overlapping membership intervals for {code}")
+        if (pd.to_datetime(intervals["生效日期"]) > pd.to_datetime(intervals["失效日期"])).any():
+            raise ValueError(f"Invalid membership interval for {code}")
+    for effective, group in membership.groupby("生效日期"):
+        if len(group) != 300:
+            LOG.warning("Membership on %s contains %d stocks, expected 300", effective, len(group))
+    if membership["生效日期"].min() != trading_days[0]:
+        raise ValueError("Membership does not cover the requested start date")
+
+
+def _normalise_baostock(frame: pd.DataFrame) -> pd.DataFrame:
+    numeric = ["open", "high", "low", "close", "preclose", "volume", "amount", "turn", "pctChg"]
+    for column in numeric:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["振幅"] = (frame["high"] - frame["low"]) / frame["preclose"] * 100
+    frame["涨跌额"] = frame["close"] - frame["preclose"]
+    frame["日期"] = pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    frame["股票代码"] = frame["code"].map(_pure_code)
+    return frame.rename(columns={
+        "open": "开盘", "close": "收盘", "high": "最高", "low": "最低",
+        "volume": "成交量", "amount": "成交额", "turn": "换手率", "pctChg": "涨跌幅",
+    })[OUTPUT_COLUMNS]
+
+
+def fetch_baostock_history(code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    response = bs.query_history_k_data_plus(
+        _bs_code(code), QUOTE_FIELDS, start_date=start_date, end_date=end_date,
+        frequency="d", adjustflag=NO_ADJUSTMENT,
+    )
+    frame = _response_rows(response, f"BaoStock quote {_pure_code(code)}")
+    return _normalise_baostock(frame) if not frame.empty else pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+
+def fetch_akshare_history(code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    if ak is None:
+        raise RuntimeError("AkShare is not installed")
+    frame = ak.stock_zh_a_hist(
+        symbol=_pure_code(code), period="daily", start_date=start_date.replace("-", ""),
+        end_date=end_date.replace("-", ""), adjust="",
+    )
+    if frame.empty:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    frame = frame.rename(columns={"日期": "日期", "开盘": "开盘", "收盘": "收盘", "最高": "最高", "最低": "最低"})
+    frame["股票代码"] = _pure_code(code)
+    for column in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌额", "换手率", "涨跌幅"]:
+        if column not in frame:
+            frame[column] = pd.NA
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return frame[OUTPUT_COLUMNS]
+
+
+def clean_quote(
+    frame: pd.DataFrame,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Apply the stable output contract to fresh and cached quote frames."""
+    cleaned = frame.copy()
+    required = set(OUTPUT_COLUMNS)
+    if not required.issubset(cleaned.columns):
+        missing = sorted(required - set(cleaned.columns))
+        raise ValueError(f"Quote is missing columns: {missing}")
+    cleaned["股票代码"] = cleaned["股票代码"].astype(str).str.zfill(6)
+    if (~cleaned["股票代码"].str.fullmatch(r"\d{6}")).any():
+        raise ValueError("Quote contains invalid stock codes")
+    cleaned["日期"] = pd.to_datetime(cleaned["日期"], errors="coerce")
+    if cleaned["日期"].isna().any():
+        raise ValueError("Quote contains invalid dates")
+    if start_date is not None and (cleaned["日期"] < pd.Timestamp(start_date)).any():
+        raise ValueError("Quote contains dates before requested start date")
+    if end_date is not None and (cleaned["日期"] > pd.Timestamp(end_date)).any():
+        raise ValueError("Quote contains dates after requested end date")
+    cleaned["日期"] = cleaned["日期"].dt.strftime("%Y-%m-%d")
+    if cleaned.duplicated(["股票代码", "日期"]).any():
+        raise ValueError("Quote contains duplicate stock/date rows")
+    for column in PRICE_COLUMNS + ZERO_FILL_COLUMNS:
+        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
+    missing_prices = cleaned[PRICE_COLUMNS].isna().any(axis=1)
+    if missing_prices.any():
+        raise ValueError(f"Quote contains {int(missing_prices.sum())} rows with missing prices")
+    if (~np.isfinite(cleaned[PRICE_COLUMNS].to_numpy())).any() or (cleaned[PRICE_COLUMNS] <= 0).any().any():
+        raise ValueError("Quote contains non-positive or non-finite prices")
+    cleaned[ZERO_FILL_COLUMNS] = cleaned[ZERO_FILL_COLUMNS].fillna(0.0)
+    if (~np.isfinite(cleaned[ZERO_FILL_COLUMNS].to_numpy())).any() or (cleaned[NONNEGATIVE_COLUMNS] < 0).any().any():
+        raise ValueError("Quote contains negative or non-finite quantities")
+    return cleaned[OUTPUT_COLUMNS]
+
+
+def filter_by_membership(data: pd.DataFrame, membership: pd.DataFrame) -> pd.DataFrame:
+    if data.empty:
+        return data
+    data = data.copy()
+    data["日期_dt"] = pd.to_datetime(data["日期"])
+    membership = membership.copy()
+    membership["生效_dt"] = pd.to_datetime(membership["生效日期"])
+    membership["失效_dt"] = pd.to_datetime(membership["失效日期"])
+    filtered: list[pd.DataFrame] = []
+    for code, stock_data in data.groupby("股票代码", sort=False):
+        intervals = membership[membership["股票代码"] == code].sort_values("生效_dt")
+        if intervals.empty:
+            continue
+        starts = intervals["生效_dt"].to_numpy()
+        ends = intervals["失效_dt"].to_numpy()
+        positions = starts.searchsorted(stock_data["日期_dt"].to_numpy(), side="right") - 1
+        valid = positions >= 0
+        valid[valid] = stock_data.loc[valid, "日期_dt"].to_numpy() <= ends[positions[valid]]
+        filtered.append(stock_data.loc[valid, OUTPUT_COLUMNS])
+    if not filtered:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    return pd.concat(filtered, ignore_index=True).sort_values(
+        ["股票代码", "日期"]
+    ).reset_index(drop=True)
+
+
+def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(temporary, index=False, encoding="utf-8-sig")
+    os.replace(temporary, path)
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    start_date = _normalise_date(args.start_date)
+    end_date = _normalise_date(args.end_date)
+    output_path = Path(args.output)
+    cache_dir = Path(args.cache_dir)
+
+    login_result = bs.login()
+    if login_result.error_code != "0":
+        raise RuntimeError(f"BaoStock login failed: {login_result.error_msg}")
     try:
-        df = pd.read_csv(output_path)
-        if '股票代码' in df.columns and len(df) > 0:
-            return set(df['股票代码'].unique())
-    except:
-        pass
-    return set()
+        trading_days = query_trade_dates(start_date, end_date, args.max_retries, args.sleep_seconds)
+        membership = build_membership(
+            trading_days, cache_dir, args.max_retries, args.sleep_seconds, args.force_refresh
+        )
+        range_label = f"{start_date[:4]}_{end_date[:4]}"
+        membership_path = output_path.parent / f"hs300_membership_{range_label}.csv"
+        _atomic_csv(membership, membership_path)
 
+        latest = membership[membership["失效日期"] == trading_days[-1]][["股票代码", "股票名称"]]
+        latest = latest.rename(columns={"股票代码": "code", "股票名称": "code_name"})
+        latest.insert(0, "updateDate", end_date)
+        _atomic_csv(latest, output_path.parent / "hs300_stock_list.csv")
 
-def get_stock_date_range(output_path, stock_code, start_date=None, end_date=None):
-    """获取某只股票在现有数据中的日期范围（可限定目标时间窗）"""
-    if not os.path.exists(output_path):
-        return None, None
-    try:
-        df = pd.read_csv(output_path)
-        if '股票代码' not in df.columns or '日期' not in df.columns:
-            return None, None
-        stock_df = df[df['股票代码'].astype(str).str.zfill(6) == stock_code].copy()
-        if len(stock_df) == 0:
-            return None, None
-
-        # 解析日期
-        stock_df.loc[:, '日期_dt'] = pd.to_datetime(stock_df['日期'], format='%Y/%m/%d', errors='coerce')
-        stock_df = stock_df.dropna(subset=['日期_dt'])
-        if len(stock_df) == 0:
-            return None, None
-
-        # 若设置了目标时间窗，仅统计目标区间内的数据覆盖情况
-        if start_date is not None:
-            start_dt = pd.to_datetime(start_date)
-            stock_df = stock_df[stock_df['日期_dt'] >= start_dt]
-        if end_date is not None:
-            end_dt = pd.to_datetime(end_date)
-            stock_df = stock_df[stock_df['日期_dt'] <= end_dt]
-        if len(stock_df) == 0:
-            return None, None
-
-        return stock_df['日期_dt'].min().strftime('%Y-%m-%d'), stock_df['日期_dt'].max().strftime('%Y-%m-%d')
-    except Exception as e:
-        print(f"  警告: 读取股票 {stock_code} 现有日期范围失败: {e}")
-        return None, None
-
-
-def parse_api_date(date_str):
-    """将API返回的日期 YYYY-MM-DD 转为 datetime"""
-    return datetime.strptime(date_str, '%Y-%m-%d')
-
-
-def format_api_date(dt):
-    """将datetime转为API日期格式 YYYY-MM-DD"""
-    return dt.strftime('%Y-%m-%d')
-
-
-def filter_data_by_date_range(df, start_date, end_date):
-    """过滤DataFrame，仅保留目标时间窗内的数据"""
-    if df is None or df.empty:
-        return df
-
-    if '日期' not in df.columns:
-        return df
-
-    filtered = df.copy()
-    filtered.loc[:, '日期_dt'] = pd.to_datetime(filtered['日期'], format='%Y/%m/%d', errors='coerce')
-    filtered = filtered.dropna(subset=['日期_dt'])
-
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
-    filtered = filtered[(filtered['日期_dt'] >= start_dt) & (filtered['日期_dt'] <= end_dt)].copy()
-    filtered = filtered.drop(columns=['日期_dt'])
-    return filtered
-
-
-def merge_stock_data(existing_df, new_df, stock_code):
-    """合并现有数据和新数据，保持同一股票数据相邻"""
-    if new_df is None or new_df.empty:
-        return existing_df
-    
-    # 统一股票代码为6位字符串格式用于比较
-    existing_df['股票代码_str'] = existing_df['股票代码'].astype(str).str.zfill(6)
-    
-    # 从现有数据中移除该股票的旧数据
-    other_df = existing_df[existing_df['股票代码_str'] != stock_code].drop(columns=['股票代码_str'])
-    
-    # 获取该股票的现有数据
-    stock_existing = existing_df[existing_df['股票代码_str'] == stock_code].drop(columns=['股票代码_str']) if stock_code in existing_df['股票代码_str'].values else pd.DataFrame()
-    
-    # 合并该股票的新旧数据
-    if not stock_existing.empty:
-        # 将日期转为datetime用于比较和去重
-        stock_existing_copy = stock_existing.copy()
-        new_df_copy = new_df.copy()
-        stock_existing_copy['日期_dt'] = pd.to_datetime(stock_existing_copy['日期'], format='%Y/%m/%d')
-        new_df_copy['日期_dt'] = pd.to_datetime(new_df_copy['日期'], format='%Y/%m/%d')
-        
-        # 合并并去重
-        combined = pd.concat([stock_existing_copy, new_df_copy], ignore_index=True)
-        combined = combined.drop_duplicates(subset=['日期_dt'], keep='last')
-        combined = combined.sort_values('日期_dt')
-        
-        # 删除临时列
-        combined = combined.drop(columns=['日期_dt'])
-    else:
-        combined = new_df
-    
-    # 重新组装：其他股票数据 + 该股票合并后的数据
-    result = pd.concat([other_df, combined], ignore_index=True)
-    return result
-
-
-def main():
-    save_dir = "./data"
-    os.makedirs(save_dir, exist_ok=True)
-    
-    start_date = "2024-01-01"
-    end_date = "2026-03-15"
-    
-    output_path = os.path.join(save_dir, "stock_data.csv")
-    
-    print(f"目标数据时间范围: {start_date} 至 {end_date}")
-    print(f"输出文件: {output_path}")
-    print("=" * 60)
-    
-    # 检查已有的数据
-    existing_stocks = get_existing_stocks(output_path)
-    if existing_stocks:
-        print(f"发现已有数据，包含 {len(existing_stocks)} 只股票，将检查每只股票是否需要增量更新")
-    
-    # 登录baostock
-    login()
-    
-    try:
-        # 获取沪深300成分股
-        hs300_df = get_hs300_stocks()
-        
-        # 保存成分股列表
-        hs300_list_path = os.path.join(save_dir, "hs300_stock_list.csv")
-        hs300_df.to_csv(hs300_list_path, index=False, encoding='utf-8-sig')
-        
-        # 读取现有数据（用于增量合并）
-        existing_df = None
-        if os.path.exists(output_path) and len(existing_stocks) > 0:
+        quote_dir = cache_dir / "quotes"
+        all_data: list[pd.DataFrame] = []
+        failures: list[dict[str, str]] = []
+        fallback_count = 0
+        for index, code in enumerate(sorted(membership["股票代码"].unique()), start=1):
+            cache_path = quote_dir / f"{code}.csv"
             try:
-                existing_df = pd.read_csv(output_path)
-                raw_len = len(existing_df)
-                existing_df = filter_data_by_date_range(existing_df, start_date, end_date)
-                filtered_len = len(existing_df)
-                print(f"  已加载现有数据: {len(existing_df)} 条记录")
-                if filtered_len != raw_len:
-                    print(f"  已按目标区间过滤旧数据: {raw_len} -> {filtered_len}")
-            except Exception as e:
-                print(f"  警告: 读取现有数据失败: {e}")
-        
-        # 准备处理所有股票（统一为6位字符串格式）
-        hs300_df['纯代码'] = hs300_df['code'].str.replace('sh.', '').str.replace('sz.', '').str.zfill(6)
-        
-        # 统计信息
-        failed_stocks = []
-        total = len(hs300_df)
-        success_count = 0
-        new_stock_count = 0
-        incremental_count = 0
-        total_new_records = 0
-        
-        for idx, row in hs300_df.iterrows():
-            bs_code = row.get('code', '')
-            stock_name = row.get('code_name', '')
-            pure_code = row.get('纯代码', '')
-            
-            # 检查该股票是否已存在数据
-            existing_min_date, existing_max_date = get_stock_date_range(output_path, pure_code, start_date, end_date)
-            
-            if existing_min_date and existing_max_date:
-                # 已有数据，检查是否需要增量
-                need_early = existing_min_date > start_date
-                need_late = existing_max_date < end_date
-                
-                if not need_early and not need_late:
-                    print(f"\n[{idx+1}/{total}] {bs_code} {stock_name} - 数据已完整 ({existing_min_date} 至 {existing_max_date})，跳过")
-                    continue
-                
-                print(f"\n[{idx+1}/{total}] {bs_code} {stock_name} - 增量更新")
-                print(f"  现有数据范围: {existing_min_date} 至 {existing_max_date}")
-                
-                # 计算需要获取的日期范围
-                fetch_ranges = []
-                if need_early:
-                    fetch_start = start_date
-                    fetch_end = (datetime.strptime(existing_min_date, '%Y-%m-%d') - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                    fetch_ranges.append((fetch_start, fetch_end, "早期"))
-                if need_late:
-                    late_start = datetime.strptime(existing_max_date, '%Y-%m-%d') + pd.Timedelta(days=1)
-                    fetch_start = max(pd.to_datetime(start_date), pd.to_datetime(late_start)).strftime('%Y-%m-%d')
-                    fetch_end = end_date
-                    fetch_ranges.append((fetch_start, fetch_end, "近期"))
-            else:
-                # 全新股票
-                print(f"\n[{idx+1}/{total}] {bs_code} {stock_name} - 全新获取")
-                fetch_ranges = [(start_date, end_date, "全量")]
-            
-            try:
-                all_new_data = []
-                for fetch_start, fetch_end, period_name in fetch_ranges:
-                    print(f"  获取{period_name}数据: {fetch_start} 至 {fetch_end}")
-                    stock_data = get_stock_history(bs_code, fetch_start, fetch_end)
-                    if stock_data is not None and not stock_data.empty:
-                        all_new_data.append(stock_data)
-                
-                if all_new_data:
-                    new_data = pd.concat(all_new_data, ignore_index=True)
-                    
-                    if existing_df is not None and len(existing_df) > 0:
-                        # 增量更新：合并数据并保持同一股票相邻
-                        existing_df = merge_stock_data(existing_df, new_data, pure_code)
-                        # 立即写回文件
-                        existing_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-                        incremental_count += 1
-                    else:
-                        # 首次写入
-                        new_data.to_csv(output_path, index=False, encoding='utf-8-sig')
-                        existing_df = new_data
-                        new_stock_count += 1
-                    
-                    total_new_records += len(new_data)
-                    success_count += 1
-                    print(f"  ✓ 获取成功，新增 {len(new_data)} 条记录")
+                if cache_path.exists() and not args.force_refresh:
+                    quote = pd.read_csv(cache_path, dtype={"股票代码": str})
                 else:
-                    print(f"  ✗ 无新数据")
-                    
-            except Exception as e:
-                print(f"  ✗ 失败: {e}")
-                failed_stocks.append((bs_code, stock_name))
-            
-            # 每10只成功获取的股票暂停一下
-            if success_count > 0 and success_count % 10 == 0:
-                print(f"\n  --- 已处理 {success_count} 只，暂停2秒 ---")
-                time.sleep(2)
-        
-        # 显示结果
-        print("\n" + "=" * 60)
-        print("本次运行完成!")
-        print(f"  - 全新获取: {new_stock_count} 只股票")
-        print(f"  - 增量更新: {incremental_count} 只股票")
-        print(f"  - 失败: {len(failed_stocks)} 只股票")
-        print(f"  - 新增记录: {total_new_records}")
-        
-        # 验证总数据
-        if os.path.exists(output_path):
-            df = pd.read_csv(output_path)
-            print(f"\n文件总览:")
-            print(f"  - 文件大小: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
-            print(f"  - 总行数: {len(df)}")
-            print(f"  - 股票数量: {df['股票代码'].nunique()}")
-            if len(df) > 0:
-                print(f"  - 时间范围: {df['日期'].min()} 至 {df['日期'].max()}")
-                
-                # 验证同一股票数据是否相邻
-                stock_blocks = df.groupby('股票代码').apply(lambda x: x.index.max() - x.index.min() + 1).sum()
-                if stock_blocks == len(df):
-                    print("  - 数据组织: ✓ 同一股票数据相邻")
-                else:
-                    print(f"  - 数据组织: 警告，股票数据块总长度({stock_blocks})与总行数({len(df)})不一致")
-                
-                print("\n前3行数据预览:")
-                print(df.head(3).to_string(index=False))
-                print("\n最后3行数据预览:")
-                print(df.tail(3).to_string(index=False))
-        
-        # 保存失败列表
-        if failed_stocks:
-            failed_df = pd.DataFrame(failed_stocks, columns=['股票代码', '股票名称'])
-            failed_path = os.path.join(save_dir, "failed_stocks.csv")
-            failed_df.to_csv(failed_path, index=False, encoding='utf-8-sig')
-            print(f"\n失败股票列表已保存至: {failed_path}")
-    
+                    try:
+                        quote = _retry(
+                            lambda: fetch_baostock_history(code, start_date, end_date),
+                            f"BaoStock quote {code}", args.max_retries, args.sleep_seconds,
+                        )
+                        if quote.empty:
+                            raise RuntimeError("BaoStock returned no quote rows")
+                    except Exception as primary_error:
+                        if args.no_akshare_fallback:
+                            raise
+                        LOG.warning("Using AkShare fallback for %s: %s", code, primary_error)
+                        quote = _retry(
+                            lambda: fetch_akshare_history(code, start_date, end_date),
+                            f"AkShare quote {code}", args.max_retries, args.sleep_seconds,
+                        )
+                        fallback_count += 1
+                    _atomic_csv(quote, cache_path)
+                quote = clean_quote(quote, start_date, end_date)
+                all_data.append(quote)
+                LOG.info("[%d] %s complete (%d rows)", index, code, len(quote))
+            except Exception as exc:
+                failures.append({"股票代码": code, "错误": str(exc)})
+                LOG.error("%s failed: %s", code, exc)
+
+        failed_path = output_path.parent / "failed_stocks.csv"
+        _atomic_csv(pd.DataFrame(failures, columns=["股票代码", "错误"]), failed_path)
+        if failures:
+            raise RuntimeError(f"Failed to collect {len(failures)} stocks; see {failed_path}")
+        combined = filter_by_membership(pd.concat(all_data, ignore_index=True), membership) if all_data else pd.DataFrame(columns=OUTPUT_COLUMNS)
+        if combined.empty:
+            raise RuntimeError("No quote data was collected")
+        duplicates = combined.duplicated(["股票代码", "日期"]).sum()
+        if duplicates:
+            raise ValueError(f"Output contains {duplicates} duplicate stock/date rows")
+        if output_path.exists():
+            backup = output_path.with_name(
+                f"{output_path.stem}.before_{range_label}_{datetime.now():%Y%m%d_%H%M%S}{output_path.suffix}"
+            )
+            shutil.copy2(output_path, backup)
+            LOG.info("Backed up existing output to %s", backup)
+        _atomic_csv(combined, output_path)
+        LOG.info("Collected %d rows for %d stocks; AkShare fallback=%d; failures=%d", len(combined), combined["股票代码"].nunique(), fallback_count, len(failures))
     finally:
-        logout()
+        bs.logout()
 
 
 if __name__ == "__main__":
